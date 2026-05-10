@@ -1,0 +1,10 @@
+TeeSQL mesh-conn
+
+This product includes software developed by dstack-tee as part of
+dstack-examples, licensed under the Apache License, Version 2.0.
+
+Upstream source:
+https://github.com/dstack-tee/dstack-examples/tree/dstack-consul-ha-db/consul-postgres-ha/mesh-conn
+
+Forked from upstream commit:
+f36201fffc6a807dc13c7ee3cfea6e9056a09c88
