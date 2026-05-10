@@ -40,19 +40,26 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
+	crand "crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -88,20 +95,28 @@ func (p *Peer) hasPort(port int) int {
 }
 
 type Config struct {
-	SelfID           string
-	Peers            []Peer
-	SignalingURL     string
-	TurnHost         string
-	TurnSecret       string
-	ClusterCAPEMPath string
-	LeafCertPath     string
-	LeafKeyPath      string
+	SelfID            string
+	Peers             []Peer
+	SignalingURL      string
+	TurnHost          string
+	TurnSecret        string
+	TurnProvider      string
+	TurnCredentialURL string
+	TurnManager       *turnCredentialManager
+	Signer            *requestSigner
+	ClusterCAPEMPath  string
+	LeafCertPath      string
+	LeafKeyPath       string
 }
 
 const (
-	defaultClusterCAPEMPath = "/teesql-shared/cluster-ca.pem"
-	defaultLeafCertPath     = "/teesql-shared/mesh-conn-leaf.pem"
-	defaultLeafKeyPath      = "/teesql-shared/mesh-conn-leaf.key"
+	defaultClusterCAPEMPath  = "/teesql-shared/cluster-ca.pem"
+	defaultLeafCertPath      = "/teesql-shared/mesh-conn-leaf.pem"
+	defaultLeafKeyPath       = "/teesql-shared/mesh-conn-leaf.key"
+	defaultTurnProvider      = "coturn"
+	turnProviderCoturn       = "coturn"
+	turnProviderCloudflare   = "cloudflare-calls"
+	defaultTurnCredentialURL = "https://mesh-signal.teesql.com/turn-credentials"
 )
 
 func loadConfig() *Config {
@@ -119,14 +134,36 @@ func loadConfig() *Config {
 	//     which propagates to every CVM via Phala's in-place compose
 	//     update path (verified in disk-persistence shakedown).
 
+	signer, err := readRequestSigner()
+	if err != nil {
+		log.Fatalf("signing config: %v", err)
+	}
+	turnProvider := envDefault("TEESQL_TURN_PROVIDER", defaultTurnProvider)
 	cfg := &Config{
-		SelfID:           readSelfID(),
-		SignalingURL:     strings.TrimRight(mustEnv("SIGNALING_URL"), "/"),
-		TurnHost:         os.Getenv("TURN_HOST"),
-		TurnSecret:       readTurnSecret(),
-		ClusterCAPEMPath: envDefault("TEESQL_CLUSTER_CA_PEM_PATH", defaultClusterCAPEMPath),
-		LeafCertPath:     envDefault("TEESQL_LEAF_CERT_PATH", defaultLeafCertPath),
-		LeafKeyPath:      envDefault("TEESQL_LEAF_KEY_PATH", defaultLeafKeyPath),
+		SelfID:            readSelfID(),
+		SignalingURL:      strings.TrimRight(mustEnv("SIGNALING_URL"), "/"),
+		TurnHost:          os.Getenv("TURN_HOST"),
+		TurnSecret:        readTurnSecret(),
+		TurnProvider:      turnProvider,
+		TurnCredentialURL: envDefault("TEESQL_TURN_CREDENTIAL_URL", defaultTurnCredentialURL),
+		Signer:            signer,
+		ClusterCAPEMPath:  envDefault("TEESQL_CLUSTER_CA_PEM_PATH", defaultClusterCAPEMPath),
+		LeafCertPath:      envDefault("TEESQL_LEAF_CERT_PATH", defaultLeafCertPath),
+		LeafKeyPath:       envDefault("TEESQL_LEAF_KEY_PATH", defaultLeafKeyPath),
+	}
+	switch cfg.TurnProvider {
+	case turnProviderCoturn:
+	case turnProviderCloudflare:
+		if cfg.Signer == nil {
+			log.Fatalf("TEESQL_TURN_PROVIDER=%s requires TEESQL_SIGNALING_P256_PRIVATE_KEY_HEX, TEESQL_SENDER_APP_ID, and TEESQL_CLUSTER", turnProviderCloudflare)
+		}
+		cfg.TurnCredentialURL = strings.TrimSpace(cfg.TurnCredentialURL)
+		if cfg.TurnCredentialURL == "" {
+			log.Fatalf("TEESQL_TURN_CREDENTIAL_URL is empty")
+		}
+		cfg.TurnManager = newTurnCredentialManager(cfg.TurnCredentialURL, cfg.Signer, http.DefaultClient)
+	default:
+		log.Fatalf("TEESQL_TURN_PROVIDER must be %q or %q, got %q", turnProviderCoturn, turnProviderCloudflare, cfg.TurnProvider)
 	}
 	if err := json.Unmarshal([]byte(mustEnv("PEERS_JSON")), &cfg.Peers); err != nil {
 		log.Fatalf("PEERS_JSON: %v", err)
@@ -327,6 +364,12 @@ func main() {
 	flag.Parse()
 	cfg := loadConfig()
 	self := cfg.peerByID(cfg.SelfID)
+	if cfg.TurnManager != nil {
+		if err := cfg.TurnManager.RefreshWithRetry(context.Background()); err != nil {
+			log.Fatalf("initial TURN credential fetch failed: %v", err)
+		}
+		go cfg.TurnManager.RefreshLoop(context.Background())
+	}
 
 	others := make([]Peer, 0, len(cfg.Peers)-1)
 	for _, p := range cfg.Peers {
@@ -928,21 +971,16 @@ func deleteSessionIfCurrent(remoteID string, sess *peerSession) {
 }
 
 func dialICE(cfg *Config, remoteID string) (*ice.Conn, error) {
-	var urls []*stun.URI
-	if cfg.TurnHost != "" {
-		user, pass := turnCreds(cfg.TurnSecret, time.Hour)
-		urls = []*stun.URI{
-			{Scheme: stun.SchemeTypeSTUN, Host: cfg.TurnHost, Port: 3478, Proto: stun.ProtoTypeUDP},
-			{Scheme: stun.SchemeTypeTURN, Host: cfg.TurnHost, Port: 3478, Proto: stun.ProtoTypeUDP, Username: user, Password: pass},
-			{Scheme: stun.SchemeTypeTURN, Host: cfg.TurnHost, Port: 3478, Proto: stun.ProtoTypeTCP, Username: user, Password: pass},
-		}
+	urls, err := turnURLs(context.Background(), cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	// MESH_CONN_RELAY_ONLY=1 restricts candidate gathering to Relay only.
 	// Use when direct (host/srflx/prflx) connectivity is unreliable — e.g.
 	// dstack worker-to-worker pairs where pion's connectivity check fails
 	// for every direct pair and the agent never gets to relay before
-	// timing out. Trades latency for guaranteed reachability via coturn.
+	// timing out. Trades latency for guaranteed reachability via TURN.
 	candidateTypes := []ice.CandidateType{
 		ice.CandidateTypeHost,
 		ice.CandidateTypeServerReflexive,
@@ -1081,7 +1119,7 @@ haveRemoteAuth:
 
 	if pair, perr := agent.GetSelectedCandidatePair(); perr == nil && pair != nil {
 		// Log full addresses + types so we can correlate stuck links against
-		// specific NAT mappings / TURN allocations on coturn.
+		// specific NAT mappings / TURN allocations.
 		log.Printf("[%s] selected pair: %s %s:%d <-> %s %s:%d (proto=%s)",
 			remoteID,
 			pair.Local.Type(), pair.Local.Address(), pair.Local.Port(),
@@ -1089,6 +1127,28 @@ haveRemoteAuth:
 			pair.Local.NetworkType().NetworkShort())
 	}
 	return conn, nil
+}
+
+func turnURLs(ctx context.Context, cfg *Config) ([]*stun.URI, error) {
+	switch cfg.TurnProvider {
+	case turnProviderCloudflare:
+		if cfg.TurnManager == nil {
+			return nil, fmt.Errorf("cloudflare-calls TURN provider not initialized")
+		}
+		return cfg.TurnManager.URIs(ctx)
+	case turnProviderCoturn:
+		if cfg.TurnHost == "" {
+			return nil, nil
+		}
+		user, pass := turnCreds(cfg.TurnSecret, time.Hour)
+		return []*stun.URI{
+			{Scheme: stun.SchemeTypeSTUN, Host: cfg.TurnHost, Port: 3478, Proto: stun.ProtoTypeUDP},
+			{Scheme: stun.SchemeTypeTURN, Host: cfg.TurnHost, Port: 3478, Proto: stun.ProtoTypeUDP, Username: user, Password: pass},
+			{Scheme: stun.SchemeTypeTURN, Host: cfg.TurnHost, Port: 3478, Proto: stun.ProtoTypeTCP, Username: user, Password: pass},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown TURN provider %q", cfg.TurnProvider)
+	}
 }
 
 func iceIPFilter() func(net.IP) bool {
@@ -1108,6 +1168,381 @@ func turnCreds(secret string, ttl time.Duration) (string, string) {
 	return user, base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
+type iceServerJSON struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username"`
+	Credential string   `json:"credential"`
+}
+
+func (s *iceServerJSON) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		URLs       any    `json:"urls"`
+		Username   string `json:"username"`
+		Credential string `json:"credential"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	switch v := raw.URLs.(type) {
+	case string:
+		s.URLs = []string{v}
+	case []any:
+		for _, item := range v {
+			u, ok := item.(string)
+			if !ok {
+				return fmt.Errorf("iceServers.urls contains non-string")
+			}
+			s.URLs = append(s.URLs, u)
+		}
+	case nil:
+		return fmt.Errorf("iceServers.urls missing")
+	default:
+		return fmt.Errorf("iceServers.urls has unsupported type %T", raw.URLs)
+	}
+	s.Username = raw.Username
+	s.Credential = raw.Credential
+	return nil
+}
+
+type turnCredentialResponse struct {
+	ICEServers []iceServerJSON `json:"iceServers"`
+	ExpiresAt  int64           `json:"expiresAt"`
+}
+
+func (r *turnCredentialResponse) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ICEServers json.RawMessage `json:"iceServers"`
+		ExpiresAt  int64           `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	iceServers := bytes.TrimSpace(raw.ICEServers)
+	if len(iceServers) == 0 {
+		return fmt.Errorf("iceServers missing")
+	}
+	switch iceServers[0] {
+	case '[':
+		if err := json.Unmarshal(iceServers, &r.ICEServers); err != nil {
+			return err
+		}
+	case '{':
+		var one iceServerJSON
+		if err := json.Unmarshal(iceServers, &one); err != nil {
+			return err
+		}
+		r.ICEServers = []iceServerJSON{one}
+	default:
+		return fmt.Errorf("iceServers must be object or array")
+	}
+	r.ExpiresAt = raw.ExpiresAt
+	return nil
+}
+
+type turnCredentialSet struct {
+	URLs      []*stun.URI
+	ExpiresAt time.Time
+	FetchedAt time.Time
+	RefreshAt time.Time
+}
+
+type turnCredentialManager struct {
+	url    string
+	signer *requestSigner
+	client *http.Client
+
+	now   func() time.Time
+	sleep func(context.Context, time.Duration) error
+
+	mu        sync.RWMutex
+	creds     *turnCredentialSet
+	failures  uint64
+	lastError string
+}
+
+func newTurnCredentialManager(rawURL string, signer *requestSigner, client *http.Client) *turnCredentialManager {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	m := &turnCredentialManager{
+		url:    rawURL,
+		signer: signer,
+		client: client,
+		now:    time.Now,
+	}
+	m.sleep = func(ctx context.Context, d time.Duration) error {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			return nil
+		}
+	}
+	return m
+}
+
+func (m *turnCredentialManager) URIs(ctx context.Context) ([]*stun.URI, error) {
+	m.mu.RLock()
+	creds := m.creds
+	if creds != nil && m.now().Before(creds.ExpiresAt) {
+		urls := cloneSTUNURIs(creds.URLs)
+		m.mu.RUnlock()
+		return urls, nil
+	}
+	m.mu.RUnlock()
+
+	if err := m.RefreshWithRetry(ctx); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.creds == nil {
+		return nil, fmt.Errorf("TURN credentials unavailable after refresh")
+	}
+	return cloneSTUNURIs(m.creds.URLs), nil
+}
+
+func (m *turnCredentialManager) RefreshLoop(ctx context.Context) {
+	for {
+		wait := time.Minute
+		m.mu.RLock()
+		if m.creds != nil {
+			wait = m.creds.RefreshAt.Sub(m.now())
+			if wait < 0 {
+				wait = 0
+			}
+		}
+		m.mu.RUnlock()
+		if err := m.sleep(ctx, wait); err != nil {
+			return
+		}
+		if err := m.RefreshWithRetry(ctx); err != nil {
+			log.Printf("turn credentials refresh stopped: %v", err)
+			return
+		}
+	}
+}
+
+func (m *turnCredentialManager) RefreshWithRetry(ctx context.Context) error {
+	backoff := time.Second
+	for {
+		if err := m.Refresh(ctx); err != nil {
+			total := atomic.AddUint64(&m.failures, 1)
+			m.mu.Lock()
+			m.lastError = err.Error()
+			m.mu.Unlock()
+			log.Printf("metric turn_credentials_refresh_failures_total=%d provider=cloudflare-calls err=%v", total, err)
+			if sleepErr := m.sleep(ctx, backoff); sleepErr != nil {
+				return sleepErr
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		return nil
+	}
+}
+
+func (m *turnCredentialManager) Refresh(ctx context.Context) error {
+	creds, err := fetchTurnCredentials(ctx, m.client, m.url, m.signer, m.now)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.creds = creds
+	m.lastError = ""
+	m.mu.Unlock()
+	log.Printf("turn credentials refreshed: urls=%d expires_at=%d refresh_at=%d",
+		len(creds.URLs), creds.ExpiresAt.Unix(), creds.RefreshAt.Unix())
+	return nil
+}
+
+func fetchTurnCredentials(ctx context.Context, client *http.Client, rawURL string, signer *requestSigner, now func() time.Time) (*turnCredentialSet, error) {
+	if now == nil {
+		now = time.Now
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if signer != nil {
+		if err := signer.Sign(req, nil); err != nil {
+			return nil, err
+		}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("TURN credential endpoint status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var parsed turnCredentialResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, err
+	}
+	fetchedAt := now()
+	expiresAt := time.Unix(parsed.ExpiresAt, 0)
+	if !expiresAt.After(fetchedAt) {
+		return nil, fmt.Errorf("TURN credential endpoint returned expired expiresAt=%d", parsed.ExpiresAt)
+	}
+	urls, err := iceServersToSTUNURIs(parsed.ICEServers)
+	if err != nil {
+		return nil, err
+	}
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("TURN credential endpoint returned no ICE server URLs")
+	}
+	ttl := expiresAt.Sub(fetchedAt)
+	return &turnCredentialSet{
+		URLs:      urls,
+		ExpiresAt: expiresAt,
+		FetchedAt: fetchedAt,
+		RefreshAt: fetchedAt.Add(ttl / 2),
+	}, nil
+}
+
+func iceServersToSTUNURIs(servers []iceServerJSON) ([]*stun.URI, error) {
+	var out []*stun.URI
+	for _, server := range servers {
+		for _, raw := range server.URLs {
+			u, err := stun.ParseURI(raw)
+			if err != nil {
+				return nil, fmt.Errorf("parse ICE server URL %q: %w", raw, err)
+			}
+			if u.Scheme == stun.SchemeTypeTURN || u.Scheme == stun.SchemeTypeTURNS {
+				if server.Username == "" || server.Credential == "" {
+					return nil, fmt.Errorf("TURN URL %q missing username or credential", raw)
+				}
+				u.Username = server.Username
+				u.Password = server.Credential
+			}
+			out = append(out, u)
+		}
+	}
+	return out, nil
+}
+
+func cloneSTUNURIs(in []*stun.URI) []*stun.URI {
+	out := make([]*stun.URI, len(in))
+	for i, u := range in {
+		if u == nil {
+			continue
+		}
+		v := *u
+		out[i] = &v
+	}
+	return out
+}
+
+type requestSigner struct {
+	appID   string
+	cluster string
+	key     *ecdsa.PrivateKey
+}
+
+func readRequestSigner() (*requestSigner, error) {
+	keyHex := strings.TrimSpace(os.Getenv("TEESQL_SIGNALING_P256_PRIVATE_KEY_HEX"))
+	appID := strings.ToLower(strings.TrimSpace(os.Getenv("TEESQL_SENDER_APP_ID")))
+	cluster := strings.ToLower(strings.TrimSpace(os.Getenv("TEESQL_CLUSTER")))
+	if keyHex == "" && appID == "" && cluster == "" {
+		return nil, nil
+	}
+	if keyHex == "" || appID == "" || cluster == "" {
+		return nil, fmt.Errorf("TEESQL_SIGNALING_P256_PRIVATE_KEY_HEX, TEESQL_SENDER_APP_ID, and TEESQL_CLUSTER must be set together")
+	}
+	if !isHexID(appID, 32) && !isHexID(appID, 20) {
+		return nil, fmt.Errorf("TEESQL_SENDER_APP_ID must be 0x-prefixed 20-byte or 32-byte hex")
+	}
+	if !isHexID(cluster, 20) {
+		return nil, fmt.Errorf("TEESQL_CLUSTER must be 0x-prefixed 20-byte hex")
+	}
+	key, err := parseP256PrivateKeyHex(keyHex)
+	if err != nil {
+		return nil, err
+	}
+	return &requestSigner{appID: appID, cluster: cluster, key: key}, nil
+}
+
+func isHexID(value string, bytes int) bool {
+	if !strings.HasPrefix(value, "0x") || len(value) != 2+bytes*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value[2:])
+	return err == nil
+}
+
+func parseP256PrivateKeyHex(raw string) (*ecdsa.PrivateKey, error) {
+	raw = strings.TrimPrefix(strings.TrimSpace(raw), "0x")
+	seed, err := hex.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("TEESQL_SIGNALING_P256_PRIVATE_KEY_HEX: %w", err)
+	}
+	if len(seed) != 32 {
+		return nil, fmt.Errorf("TEESQL_SIGNALING_P256_PRIVATE_KEY_HEX must be 32 bytes, got %d", len(seed))
+	}
+	curve := elliptic.P256()
+	d := new(big.Int).SetBytes(seed)
+	if d.Sign() <= 0 || d.Cmp(curve.Params().N) >= 0 {
+		return nil, fmt.Errorf("TEESQL_SIGNALING_P256_PRIVATE_KEY_HEX is outside the P-256 scalar range")
+	}
+	x, y := curve.ScalarBaseMult(seed)
+	return &ecdsa.PrivateKey{PublicKey: ecdsa.PublicKey{Curve: curve, X: x, Y: y}, D: d}, nil
+}
+
+func (s *requestSigner) Sign(req *http.Request, body []byte) error {
+	nonce, err := randomHex(8)
+	if err != nil {
+		return err
+	}
+	timestamp := time.Now().Unix()
+	digest := teesqlSignatureDigest(s.appID, s.cluster, nonce, timestamp, req.Method, req.URL.Path, body)
+	r, ss, err := ecdsa.Sign(crand.Reader, s.key, digest)
+	if err != nil {
+		return err
+	}
+	sig := make([]byte, 64)
+	r.FillBytes(sig[:32])
+	ss.FillBytes(sig[32:])
+	req.Header.Set("X-Teesql-Sig-Version", "v1")
+	req.Header.Set("X-Teesql-Sender-AppId", s.appID)
+	req.Header.Set("X-Teesql-Cluster", s.cluster)
+	req.Header.Set("X-Teesql-Nonce", nonce)
+	req.Header.Set("X-Teesql-Timestamp", strconv.FormatInt(timestamp, 10))
+	req.Header.Set("X-Teesql-Sig", base64.StdEncoding.EncodeToString(sig))
+	return nil
+}
+
+func teesqlSignatureDigest(appID, cluster, nonce string, timestamp int64, method, path string, body []byte) []byte {
+	bodyHash := sha256.Sum256(body)
+	var buf bytes.Buffer
+	buf.WriteString(strings.ToLower(appID))
+	buf.WriteString(strings.ToLower(cluster))
+	buf.WriteString(strings.ToLower(nonce))
+	buf.WriteString(strconv.FormatInt(timestamp, 10))
+	buf.WriteString(strings.ToUpper(method))
+	buf.WriteString(path)
+	buf.Write(bodyHash[:])
+	digest := sha256.Sum256(buf.Bytes())
+	return digest[:]
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := crand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
 // =============================================================================
 // signaling — same wire format as phase-0/icetest
 // =============================================================================
@@ -1120,8 +1555,19 @@ type Message struct {
 
 func publish(cfg *Config, to, typ, data string) {
 	body, _ := json.Marshal(Message{From: cfg.SelfID, Type: typ, Data: data})
-	resp, err := http.Post(cfg.SignalingURL+"/publish?to="+url.QueryEscape(to),
-		"application/json", strings.NewReader(string(body)))
+	req, err := http.NewRequest(http.MethodPost, cfg.SignalingURL+"/publish?to="+url.QueryEscape(to), bytes.NewReader(body))
+	if err != nil {
+		log.Printf("publish request err: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if cfg.Signer != nil {
+		if err := cfg.Signer.Sign(req, body); err != nil {
+			log.Printf("publish sign err: %v", err)
+			return
+		}
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("publish err: %v", err)
 		return
@@ -1132,7 +1578,20 @@ func publish(cfg *Config, to, typ, data string) {
 
 func pollLoop(cfg *Config) {
 	for {
-		resp, err := http.Get(cfg.SignalingURL + "/poll?peer=" + url.QueryEscape(cfg.SelfID))
+		req, err := http.NewRequest(http.MethodGet, cfg.SignalingURL+"/poll?peer="+url.QueryEscape(cfg.SelfID), nil)
+		if err != nil {
+			log.Printf("poll request err: %v", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		if cfg.Signer != nil {
+			if err := cfg.Signer.Sign(req, nil); err != nil {
+				log.Printf("poll sign err: %v", err)
+				time.Sleep(time.Second)
+				continue
+			}
+		}
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			log.Printf("poll err: %v", err)
 			time.Sleep(time.Second)

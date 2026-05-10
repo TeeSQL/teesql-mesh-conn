@@ -33,7 +33,7 @@ This fork retains the upstream `LICENSE` and adds `NOTICE` attribution.
 go mod tidy
 go build -o teesql-mesh-conn ./...
 go test ./...
-docker build -t ghcr.io/teesql/teesql-mesh-conn:v0.1.1 .
+docker build -t ghcr.io/teesql/teesql-mesh-conn:v0.1.2 .
 ```
 
 ## Configuration
@@ -49,6 +49,22 @@ The upstream environment variables remain in use:
 
 TeeSQL adds:
 
+- `TEESQL_TURN_PROVIDER`: `coturn` or `cloudflare-calls`. Defaults to
+  `coturn` for backwards compatibility. `coturn` uses `TURN_HOST` plus
+  `TURN_SHARED_SECRET` or `/run/secrets/turn` and computes the legacy
+  coturn REST-HMAC username/password locally.
+- `TEESQL_TURN_CREDENTIAL_URL`: Worker endpoint used when
+  `TEESQL_TURN_PROVIDER=cloudflare-calls`. Defaults to
+  `https://mesh-signal.teesql.com/turn-credentials`.
+- `TEESQL_SIGNALING_P256_PRIVATE_KEY_HEX`: 32-byte hex P-256 private key
+  used to sign mesh-signal requests. Required for Cloudflare Calls TURN
+  and optional for legacy coturn deployments until the Worker requires
+  signed publish/poll.
+- `TEESQL_SENDER_APP_ID`: sender app id placed in
+  `X-Teesql-Sender-AppId`. Required with
+  `TEESQL_SIGNALING_P256_PRIVATE_KEY_HEX`.
+- `TEESQL_CLUSTER`: cluster diamond address placed in `X-Teesql-Cluster`.
+  Required with `TEESQL_SIGNALING_P256_PRIVATE_KEY_HEX`.
 - `TEESQL_CLUSTER_CA_PEM_PATH`: path to the cluster CA certificate PEM.
   Defaults to `/teesql-shared/cluster-ca.pem`.
 - `TEESQL_LEAF_CERT_PATH`: path to this member's mesh-conn leaf
@@ -66,6 +82,53 @@ mesh-conn QUIC leaf, and writes:
 
 mesh-conn only loads the leaf cert/key and the CA root. It does not sign
 certificates and does not read a cluster CA private key.
+
+### Cloudflare Calls TURN
+
+Cloudflare Realtime TURN uses long-lived account-side TURN keys to issue
+short-lived per-session credentials. Do not put the Cloudflare TURN key or
+API token in mesh-conn CVMs. The TeeSQL deployment path is:
+
+1. Create a Cloudflare Calls/Realtime TURN key in the Cloudflare dashboard
+   or with `POST /accounts/{account_id}/calls/turn_keys`.
+2. Store the TURN key id and token only in the `mesh-signal.teesql.com`
+   Worker secrets.
+3. Expose `GET /turn-credentials` from the Worker. The response must be:
+
+   ```json
+   {
+     "iceServers": [{
+       "urls": [
+         "stun:stun.cloudflare.com:3478",
+         "turn:turn.cloudflare.com:3478?transport=udp",
+         "turn:turn.cloudflare.com:3478?transport=tcp",
+         "turns:turn.cloudflare.com:5349?transport=tcp"
+       ],
+       "username": "<ephemeral>",
+       "credential": "<ephemeral>"
+     }],
+     "expiresAt": 1770000000
+   }
+   ```
+
+4. Set `TEESQL_TURN_PROVIDER=cloudflare-calls` in mesh-conn. On startup,
+   mesh-conn fetches signed credentials from the Worker, refreshes them at
+   50% of their TTL, and retries failures with exponential backoff. Refresh
+   failures are logged as
+   `metric turn_credentials_refresh_failures_total=<n> provider=cloudflare-calls`.
+
+Signed Worker requests use:
+
+- `X-Teesql-Sig-Version: v1`
+- `X-Teesql-Sender-AppId`
+- `X-Teesql-Cluster`
+- `X-Teesql-Nonce`
+- `X-Teesql-Timestamp`
+- `X-Teesql-Sig`
+
+The signature is ECDSA P-256 over
+`SHA-256(sender_app_id || cluster || nonce || timestamp || method || path || SHA-256(body))`,
+encoded as base64 raw `r || s`.
 
 ## Upstream Sync
 
