@@ -41,15 +41,10 @@ package main
 
 import (
 	"context"
-	"crypto"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -58,7 +53,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -100,12 +94,14 @@ type Config struct {
 	TurnHost         string
 	TurnSecret       string
 	ClusterCAPEMPath string
-	ClusterCAKeyPath string
+	LeafCertPath     string
+	LeafKeyPath      string
 }
 
 const (
 	defaultClusterCAPEMPath = "/teesql-shared/cluster-ca.pem"
-	defaultClusterCAKeyPath = "/teesql-shared/cluster-ca.key"
+	defaultLeafCertPath     = "/teesql-shared/mesh-conn-leaf.pem"
+	defaultLeafKeyPath      = "/teesql-shared/mesh-conn-leaf.key"
 )
 
 func loadConfig() *Config {
@@ -129,7 +125,8 @@ func loadConfig() *Config {
 		TurnHost:         os.Getenv("TURN_HOST"),
 		TurnSecret:       readTurnSecret(),
 		ClusterCAPEMPath: envDefault("TEESQL_CLUSTER_CA_PEM_PATH", defaultClusterCAPEMPath),
-		ClusterCAKeyPath: envDefault("TEESQL_CLUSTER_CA_KEY_PATH", defaultClusterCAKeyPath),
+		LeafCertPath:     envDefault("TEESQL_LEAF_CERT_PATH", defaultLeafCertPath),
+		LeafKeyPath:      envDefault("TEESQL_LEAF_KEY_PATH", defaultLeafKeyPath),
 	}
 	if err := json.Unmarshal([]byte(mustEnv("PEERS_JSON")), &cfg.Peers); err != nil {
 		log.Fatalf("PEERS_JSON: %v", err)
@@ -789,13 +786,14 @@ func clientTLS(cfg *Config) *tls.Config {
 	if err != nil {
 		log.Fatalf("cluster CA root: %v", err)
 	}
-	cert := meshTLSCertificate(cfg)
+	cert := loadLeafCertificate(cfg)
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      roots,
-		ServerName:   "mesh-conn",
-		NextProtos:   []string{quicALPN},
-		MinVersion:   tls.VersionTLS13,
+		Certificates:       []tls.Certificate{cert},
+		RootCAs:            roots,
+		ServerName:         "mesh-conn",
+		InsecureSkipVerify: false,
+		NextProtos:         []string{quicALPN},
+		MinVersion:         tls.VersionTLS13,
 	}
 }
 
@@ -804,51 +802,23 @@ func serverTLS(cfg *Config) *tls.Config {
 	if err != nil {
 		log.Fatalf("cluster CA root: %v", err)
 	}
-	cert := meshTLSCertificate(cfg)
+	cert := loadLeafCertificate(cfg)
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    roots,
-		NextProtos:   []string{quicALPN},
-		MinVersion:   tls.VersionTLS13,
+		Certificates:       []tls.Certificate{cert},
+		ClientAuth:         tls.RequireAndVerifyClientCert,
+		ClientCAs:          roots,
+		InsecureSkipVerify: false,
+		NextProtos:         []string{quicALPN},
+		MinVersion:         tls.VersionTLS13,
 	}
 }
 
-func meshTLSCertificate(cfg *Config) tls.Certificate {
-	ca, err := loadClusterCACert(cfg.ClusterCAPEMPath)
+func loadLeafCertificate(cfg *Config) tls.Certificate {
+	cert, err := tls.LoadX509KeyPair(cfg.LeafCertPath, cfg.LeafKeyPath)
 	if err != nil {
-		log.Fatalf("cluster CA cert: %v", err)
+		log.Fatalf("mesh-conn leaf cert/key: %v", err)
 	}
-	caKey, err := loadClusterCAKey(cfg.ClusterCAKeyPath)
-	if err != nil {
-		log.Fatalf("cluster CA key: %v", err)
-	}
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		log.Fatalf("ecdsa keygen: %v", err)
-	}
-	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serial, err := rand.Int(rand.Reader, serialLimit)
-	if err != nil {
-		log.Fatalf("serial generation: %v", err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: cfg.SelfID},
-		DNSNames:     []string{"mesh-conn"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &priv.PublicKey, caKey)
-	if err != nil {
-		log.Fatalf("cluster-CA-signed cert: %v", err)
-	}
-	return tls.Certificate{
-		Certificate: [][]byte{der},
-		PrivateKey:  priv,
-	}
+	return cert
 }
 
 func loadClusterCA(path string) (*x509.Certificate, *x509.CertPool, error) {
@@ -881,33 +851,6 @@ func loadClusterCACert(path string) (*x509.Certificate, error) {
 		return nil, fmt.Errorf("%s: certificate is not a CA", path)
 	}
 	return cert, nil
-}
-
-func loadClusterCAKey(path string) (crypto.Signer, error) {
-	pemBytes, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
-	}
-	block, _ := pem.Decode(pemBytes)
-	if block == nil {
-		return nil, fmt.Errorf("%s: missing private key PEM block", path)
-	}
-	for _, parse := range []func([]byte) (any, error){
-		func(b []byte) (any, error) { return x509.ParsePKCS8PrivateKey(b) },
-		func(b []byte) (any, error) { return x509.ParseECPrivateKey(b) },
-		func(b []byte) (any, error) { return x509.ParsePKCS1PrivateKey(b) },
-	} {
-		key, err := parse(block.Bytes)
-		if err != nil {
-			continue
-		}
-		signer, ok := key.(crypto.Signer)
-		if !ok {
-			return nil, fmt.Errorf("%s: private key is not a signer", path)
-		}
-		return signer, nil
-	}
-	return nil, fmt.Errorf("%s: unsupported private key format", path)
 }
 
 // =============================================================================

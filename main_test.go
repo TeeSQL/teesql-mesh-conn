@@ -28,7 +28,9 @@ import (
 
 func TestMeshConnReconnectsAfterPeerRestart(t *testing.T) {
 	bin := buildMeshBinary(t)
-	certPath, keyPath := writeTestCA(t, t.TempDir(), "cluster")
+	ca := writeTestCA(t, t.TempDir(), "cluster")
+	aLeafCert, aLeafKey := writeTestLeaf(t, t.TempDir(), ca, "a")
+	bLeafCert, bLeafKey := writeTestLeaf(t, t.TempDir(), ca, "b")
 	signal := newTestSignalBroker(t)
 	defer signal.Close()
 
@@ -39,9 +41,9 @@ func TestMeshConnReconnectsAfterPeerRestart(t *testing.T) {
 		{ID: "b", Ports: []int{bPort}},
 	}
 
-	a := startMeshProc(t, bin, "a", peers, signal.URL, certPath, keyPath)
+	a := startMeshProc(t, bin, "a", peers, signal.URL, ca.certPath, aLeafCert, aLeafKey)
 	defer a.stop()
-	b := startMeshProc(t, bin, "b", peers, signal.URL, certPath, keyPath)
+	b := startMeshProc(t, bin, "b", peers, signal.URL, ca.certPath, bLeafCert, bLeafKey)
 	defer b.stop()
 
 	if !a.waitForCount("link up", 1, 30*time.Second) {
@@ -52,7 +54,7 @@ func TestMeshConnReconnectsAfterPeerRestart(t *testing.T) {
 	}
 
 	a.stop()
-	a = startMeshProc(t, bin, "a", peers, signal.URL, certPath, keyPath)
+	a = startMeshProc(t, bin, "a", peers, signal.URL, ca.certPath, aLeafCert, aLeafKey)
 	defer a.stop()
 
 	if !b.waitForCount("link up", 2, 30*time.Second) {
@@ -63,10 +65,12 @@ func TestMeshConnReconnectsAfterPeerRestart(t *testing.T) {
 	}
 }
 
-func TestMeshConnRejectsWrongClusterCA(t *testing.T) {
+func TestMeshConnRejectsLeafFromWrongClusterCA(t *testing.T) {
 	bin := buildMeshBinary(t)
-	aCertPath, aKeyPath := writeTestCA(t, t.TempDir(), "cluster-a")
-	bCertPath, bKeyPath := writeTestCA(t, t.TempDir(), "cluster-b")
+	trustedCA := writeTestCA(t, t.TempDir(), "cluster-a")
+	wrongCA := writeTestCA(t, t.TempDir(), "cluster-b")
+	aLeafCert, aLeafKey := writeTestLeaf(t, t.TempDir(), trustedCA, "a")
+	bLeafCert, bLeafKey := writeTestLeaf(t, t.TempDir(), wrongCA, "b")
 	signal := newTestSignalBroker(t)
 	defer signal.Close()
 
@@ -77,9 +81,9 @@ func TestMeshConnRejectsWrongClusterCA(t *testing.T) {
 		{ID: "b", Ports: []int{bPort}},
 	}
 
-	a := startMeshProc(t, bin, "a", peers, signal.URL, aCertPath, aKeyPath)
+	a := startMeshProc(t, bin, "a", peers, signal.URL, trustedCA.certPath, aLeafCert, aLeafKey)
 	defer a.stop()
-	b := startMeshProc(t, bin, "b", peers, signal.URL, bCertPath, bKeyPath)
+	b := startMeshProc(t, bin, "b", peers, signal.URL, trustedCA.certPath, bLeafCert, bLeafKey)
 	defer b.stop()
 
 	deadline := time.Now().Add(20 * time.Second)
@@ -101,25 +105,51 @@ func TestMeshConnRejectsWrongClusterCA(t *testing.T) {
 }
 
 func TestClientTLSRejectsWrongClusterCA(t *testing.T) {
-	aCertPath, aKeyPath := writeTestCA(t, t.TempDir(), "cluster-a")
-	bCertPath, bKeyPath := writeTestCA(t, t.TempDir(), "cluster-b")
-	clientCfg := &Config{SelfID: "a", ClusterCAPEMPath: aCertPath, ClusterCAKeyPath: aKeyPath}
-	serverCfg := &Config{SelfID: "b", ClusterCAPEMPath: bCertPath, ClusterCAKeyPath: bKeyPath}
+	trustedCA := writeTestCA(t, t.TempDir(), "cluster-a")
+	wrongCA := writeTestCA(t, t.TempDir(), "cluster-b")
+	clientLeafCert, clientLeafKey := writeTestLeaf(t, t.TempDir(), trustedCA, "a")
+	serverLeafCert, serverLeafKey := writeTestLeaf(t, t.TempDir(), wrongCA, "b")
+	clientCfg := &Config{SelfID: "a", ClusterCAPEMPath: trustedCA.certPath, LeafCertPath: clientLeafCert, LeafKeyPath: clientLeafKey}
+	serverCfg := &Config{SelfID: "b", ClusterCAPEMPath: trustedCA.certPath, LeafCertPath: serverLeafCert, LeafKeyPath: serverLeafKey}
 
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	if tcpLn, ok := ln.(*net.TCPListener); ok {
+		_ = tcpLn.SetDeadline(time.Now().Add(5 * time.Second))
+	}
 
 	serverErr := make(chan error, 1)
 	go func() {
+		serverConn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer serverConn.Close()
+		_ = serverConn.SetDeadline(time.Now().Add(5 * time.Second))
 		serverErr <- tls.Server(serverConn, serverTLS(serverCfg)).Handshake()
 	}()
 
-	err := tls.Client(clientConn, clientTLS(clientCfg)).Handshake()
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+	_ = clientConn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	err = tls.Client(clientConn, clientTLS(clientCfg)).Handshake()
 	if err == nil {
 		t.Fatal("client accepted a server certificate signed by the wrong cluster CA")
 	}
-	<-serverErr
+	_ = clientConn.Close()
+	select {
+	case <-serverErr:
+	case <-time.After(time.Second):
+		t.Fatal("server handshake did not unblock after client rejection")
+	}
 }
 
 func TestDeleteSessionDrainsAndRemovesAuth(t *testing.T) {
@@ -184,7 +214,7 @@ type meshProc struct {
 	buf   bytes.Buffer
 }
 
-func startMeshProc(t *testing.T, bin, id string, peers []Peer, signalURL, caCertPath, caKeyPath string) *meshProc {
+func startMeshProc(t *testing.T, bin, id string, peers []Peer, signalURL, caCertPath, leafCertPath, leafKeyPath string) *meshProc {
 	t.Helper()
 	peersJSON, err := json.Marshal(peers)
 	if err != nil {
@@ -196,7 +226,8 @@ func startMeshProc(t *testing.T, bin, id string, peers []Peer, signalURL, caCert
 		"PEERS_JSON="+string(peersJSON),
 		"SIGNALING_URL="+signalURL,
 		"TEESQL_CLUSTER_CA_PEM_PATH="+caCertPath,
-		"TEESQL_CLUSTER_CA_KEY_PATH="+caKeyPath,
+		"TEESQL_LEAF_CERT_PATH="+leafCertPath,
+		"TEESQL_LEAF_KEY_PATH="+leafKeyPath,
 		"MESH_CONN_QUIC_KEEPALIVE_SECONDS=1",
 		"MESH_CONN_QUIC_MAX_IDLE_SECONDS=2",
 		"MESH_CONN_QUIC_HANDSHAKE_SECONDS=5",
@@ -295,7 +326,13 @@ func buildMeshBinary(t *testing.T) string {
 	return path
 }
 
-func writeTestCA(t *testing.T, dir, name string) (string, string) {
+type testCA struct {
+	certPath string
+	cert     *x509.Certificate
+	key      *ecdsa.PrivateKey
+}
+
+func writeTestCA(t *testing.T, dir, name string) *testCA {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -330,6 +367,45 @@ func writeTestCA(t *testing.T, dir, name string) (string, string) {
 	}
 	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0600); err != nil {
 		t.Fatalf("write ca key: %v", err)
+	}
+	return &testCA{certPath: certPath, cert: cert, key: key}
+}
+
+func writeTestLeaf(t *testing.T, dir string, ca *testCA, name string) (string, string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate leaf key: %v", err)
+	}
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		t.Fatalf("generate leaf serial: %v", err)
+	}
+	cert := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: name},
+		DNSNames:     []string{"mesh-conn", name},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, cert, ca.cert, &key.PublicKey, ca.key)
+	if err != nil {
+		t.Fatalf("create leaf cert: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal leaf key: %v", err)
+	}
+	certPath := filepath.Join(dir, name+"-leaf.pem")
+	keyPath := filepath.Join(dir, name+"-leaf.key")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
+		t.Fatalf("write leaf cert: %v", err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0600); err != nil {
+		t.Fatalf("write leaf key: %v", err)
 	}
 	return certPath, keyPath
 }
@@ -366,8 +442,10 @@ func TestDurationEnv(t *testing.T) {
 
 func Example_env() {
 	fmt.Println(defaultClusterCAPEMPath)
-	fmt.Println(defaultClusterCAKeyPath)
+	fmt.Println(defaultLeafCertPath)
+	fmt.Println(defaultLeafKeyPath)
 	// Output:
 	// /teesql-shared/cluster-ca.pem
-	// /teesql-shared/cluster-ca.key
+	// /teesql-shared/mesh-conn-leaf.pem
+	// /teesql-shared/mesh-conn-leaf.key
 }
