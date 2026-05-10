@@ -26,6 +26,16 @@ This fork retains the upstream `LICENSE` and adds `NOTICE` attribution.
   requires and verifies client certs (`main.go:802`), and each process
   presents a data-sidecar-issued leaf certificate loaded from
   `/teesql-shared/`.
+- v0.2.0 mesh protocol pivot: service-map PEERS_JSON entries can bind
+  peer front-door listeners on `127.77.0.<n>`, route streams by service
+  slot instead of raw port, and source-bind local service dials on
+  `127.77.0.<self_n>`. Legacy `ports` PEERS_JSON remains supported.
+- Fresh single-member clusters are valid: a self-only PEERS_JSON keeps
+  mesh-conn running and healthy while no peer links exist.
+- `/health` is served on `127.0.0.1:8086/health` by default. It returns
+  `200` only when this member's `127.77.0.<self_n>` loopback address is
+  bindable and either no remote peers are configured or at least one peer
+  handshake completed in the last 60 seconds.
 
 ## Build
 
@@ -33,19 +43,26 @@ This fork retains the upstream `LICENSE` and adds `NOTICE` attribution.
 go mod tidy
 go build -o teesql-mesh-conn ./...
 go test ./...
-docker build -t ghcr.io/teesql/teesql-mesh-conn:v0.1.2 .
+docker build -t ghcr.io/teesql/teesql-mesh-conn:v0.2.0 .
 ```
 
 ## Configuration
 
-The upstream environment variables remain in use:
+Required deployment contract:
 
 - `PEER_ID`
 - `PEERS_JSON`
 - `SIGNALING_URL`
 - `TURN_HOST`
+- `TEESQL_CLUSTER_CA_PEM_PATH`
+- `TEESQL_LEAF_CERT_PATH`
+- `TEESQL_LEAF_KEY_PATH`
+
+Optional:
+
 - `TURN_SHARED_SECRET`
 - `MESH_CONN_RELAY_ONLY`
+- `MESH_CONN_HEALTH_ADDR`: defaults to `127.0.0.1:8086`.
 
 TeeSQL adds:
 
@@ -71,6 +88,56 @@ TeeSQL adds:
   certificate PEM. Defaults to `/teesql-shared/mesh-conn-leaf.pem`.
 - `TEESQL_LEAF_KEY_PATH`: path to this member's mesh-conn leaf private
   key PEM. Defaults to `/teesql-shared/mesh-conn-leaf.key`.
+
+Use `TURN_HOST` singular. The binary does not read `TURN_HOSTS`. Use
+`TEESQL_LEAF_CERT_PATH` and `TEESQL_LEAF_KEY_PATH`; the binary does not
+read older `TEESQL_MESH_CERT_*` names.
+
+`PEERS_JSON` accepts the legacy port form:
+
+```json
+[
+  {"id": "m1", "ports": [20000, 20001]},
+  {"id": "m2", "ports": [20016, 20017]}
+]
+```
+
+For TeeSQL Postgres replication, prefer the service-map form. Each peer
+must declare `n` or `self_n` so mesh-conn can derive `127.77.0.<n>`.
+`remote_port` is the local service port on that member. The stream header
+carries `slot`; receivers route by slot and service name rather than by
+raw port number.
+
+```json
+[
+  {
+    "id": "m1",
+    "n": 1,
+    "services": [
+      {"slot": 0, "service": "pg-repl", "remote_port": 5432},
+      {"slot": 1, "service": "control", "remote_port": 8443}
+    ]
+  },
+  {
+    "id": "m2",
+    "n": 2,
+    "services": [
+      {"slot": 0, "service": "pg-repl", "remote_port": 5432},
+      {"slot": 1, "service": "control", "remote_port": 8443}
+    ]
+  }
+]
+```
+
+The container entrypoint installs the loopback route needed by the
+`127.77.0.0/16` binding pivot:
+
+```sh
+ip route add 127.77.0.0/16 dev lo 2>/dev/null || true
+```
+
+If you bypass the packaged entrypoint, run that command before starting
+the binary.
 
 The data-sidecar owns the cluster CA private key material and never hands
 it to mesh-conn. At boot, data-sidecar derives the cluster CA, writes the

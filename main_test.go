@@ -152,6 +152,66 @@ func TestClientTLSRejectsWrongClusterCA(t *testing.T) {
 	}
 }
 
+func TestMeshConnSinglePeerStaysUp(t *testing.T) {
+	bin := buildMeshBinary(t)
+	ca := writeTestCA(t, t.TempDir(), "cluster")
+	leafCert, leafKey := writeTestLeaf(t, t.TempDir(), ca, "a")
+	signal := newTestSignalBroker(t)
+	defer signal.Close()
+
+	peers := []Peer{
+		{ID: "a", N: 1, Services: []PeerService{{Slot: 0, Service: "pg-repl", RemotePort: 5432}}},
+	}
+	a := startMeshProc(t, bin, "a", peers, signal.URL, ca.certPath, leafCert, leafKey)
+	defer a.stop()
+
+	select {
+	case <-a.done:
+		t.Fatalf("single-peer mesh-conn exited:\n%s", a.logs())
+	case <-time.After(500 * time.Millisecond):
+	}
+	if !strings.Contains(a.logs(), "single-peer PEERS_JSON") {
+		t.Fatalf("single-peer startup log missing:\n%s", a.logs())
+	}
+}
+
+func TestHealthEndpointRequiresBoundLoopbackAndFreshHandshake(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	h := &healthState{
+		selfIP:    net.ParseIP("127.77.0.7").To4(),
+		peerCount: 1,
+		now:       func() time.Time { return now },
+		canBind:   func(ip net.IP) bool { return ip.Equal(net.ParseIP("127.77.0.7")) },
+	}
+
+	rec := httptest.NewRecorder()
+	h.handler(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status without handshake = %d, want 503", rec.Code)
+	}
+
+	h.recordHandshake()
+	rec = httptest.NewRecorder()
+	h.handler(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status after handshake = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	now = now.Add(61 * time.Second)
+	rec = httptest.NewRecorder()
+	h.handler(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status after stale handshake = %d, want 503", rec.Code)
+	}
+
+	h.peerCount = 0
+	rec = httptest.NewRecorder()
+	h.handler(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("single-peer status = %d, want 200", rec.Code)
+	}
+}
+
 func TestDeleteSessionDrainsAndRemovesAuth(t *testing.T) {
 	sess := &peerSession{authCh: make(chan [2]string, 1)}
 	sess.authCh <- [2]string{"old", "auth"}
@@ -232,6 +292,7 @@ func startMeshProc(t *testing.T, bin, id string, peers []Peer, signalURL, caCert
 		"MESH_CONN_QUIC_MAX_IDLE_SECONDS=2",
 		"MESH_CONN_QUIC_HANDSHAKE_SECONDS=5",
 		"MESH_CONN_LOOPBACK_ONLY=1",
+		"MESH_CONN_HEALTH_ADDR=127.0.0.1:0",
 	)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {

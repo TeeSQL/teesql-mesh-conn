@@ -20,6 +20,75 @@ func TestValidatePeers_OK(t *testing.T) {
 	}
 }
 
+func TestValidatePeers_SinglePeerOK(t *testing.T) {
+	cfg := &Config{
+		SelfID: "ctrl",
+		Peers: []Peer{
+			{ID: "ctrl", N: 1, Services: []PeerService{{Slot: 0, Service: "pg-repl", RemotePort: 5432}}},
+		},
+	}
+	if err := validatePeers(cfg); err != nil {
+		t.Fatalf("single peer should validate: %v", err)
+	}
+}
+
+func TestValidatePeers_ServiceMapOK(t *testing.T) {
+	cfg := &Config{
+		SelfID: "m1",
+		Peers: []Peer{
+			{ID: "m1", N: 1, Services: []PeerService{
+				{Slot: 0, Service: "pg-repl", RemotePort: 5432},
+				{Slot: 1, Service: "control", RemotePort: 8443},
+			}},
+			{ID: "m2", N: 2, Services: []PeerService{
+				{Slot: 1, Service: "control", RemotePort: 8443},
+				{Slot: 0, Service: "pg-repl", RemotePort: 5432},
+			}},
+		},
+	}
+	if err := validatePeers(cfg); err != nil {
+		t.Fatalf("service map should validate: %v", err)
+	}
+}
+
+func TestValidatePeers_ServiceMapRequiresLoopbackIP(t *testing.T) {
+	cfg := &Config{
+		SelfID: "m1",
+		Peers: []Peer{
+			{ID: "m1", Services: []PeerService{{Slot: 0, Service: "pg-repl", RemotePort: 5432}}},
+		},
+	}
+	err := validatePeers(cfg)
+	if err == nil || !strings.Contains(err.Error(), "services require") {
+		t.Fatalf("want loopback-ip error, got %v", err)
+	}
+}
+
+func TestBuildForwardRoutes_ServiceMapUses12777AndSourceBind(t *testing.T) {
+	self := Peer{ID: "m1", N: 1, Services: []PeerService{{Slot: 0, Service: "pg-repl", RemotePort: 5432}}}
+	peer := Peer{ID: "m2", N: 2, Services: []PeerService{{Slot: 0, Service: "pg-repl", RemotePort: 5432}}}
+
+	routes, err := buildForwardRoutes(self, peer)
+	if err != nil {
+		t.Fatalf("buildForwardRoutes: %v", err)
+	}
+	if got, want := routes[0].ListenIP.String(), "127.77.0.2"; got != want {
+		t.Fatalf("listen IP = %s, want %s", got, want)
+	}
+	if got, want := routes[0].ListenPort, 5432; got != want {
+		t.Fatalf("listen port = %d, want %d", got, want)
+	}
+	if got, want := routes[0].LocalIP.String(), "127.77.0.1"; got != want {
+		t.Fatalf("local dial IP = %s, want %s", got, want)
+	}
+	if got, want := routes[0].SourceIP.String(), "127.77.0.1"; got != want {
+		t.Fatalf("source bind IP = %s, want %s", got, want)
+	}
+	if got, want := routes[0].HeaderKey, 0; got != want {
+		t.Fatalf("header key = %d, want service slot %d", got, want)
+	}
+}
+
 func TestValidatePeers_PortCollision(t *testing.T) {
 	cfg := &Config{
 		SelfID: "ctrl",

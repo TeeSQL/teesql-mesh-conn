@@ -64,6 +64,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,18 +81,141 @@ import (
 // =============================================================================
 
 type Peer struct {
-	ID    string `json:"id"`
-	Ports []int  `json:"ports"`
+	ID         string        `json:"id"`
+	N          int           `json:"n,omitempty"`
+	SelfN      int           `json:"self_n,omitempty"`
+	LoopbackIP string        `json:"loopback_ip,omitempty"`
+	Ports      []int         `json:"ports,omitempty"`
+	Services   []PeerService `json:"services,omitempty"`
 }
 
-// hasPort returns the index of port in p.Ports, or -1 if absent.
-func (p *Peer) hasPort(port int) int {
-	for i, q := range p.Ports {
-		if q == port {
+type PeerService struct {
+	Slot       int    `json:"slot"`
+	Service    string `json:"service"`
+	RemotePort int    `json:"remote_port,omitempty"`
+	LocalPort  int    `json:"local_port,omitempty"`
+}
+
+func (s PeerService) port() int {
+	if s.RemotePort != 0 {
+		return s.RemotePort
+	}
+	return s.LocalPort
+}
+
+func (p *Peer) hasRouteKey(key int) int {
+	routes := p.routes()
+	for i, r := range routes {
+		if r.HeaderKey == key {
 			return i
 		}
 	}
 	return -1
+}
+
+func (p *Peer) usesServices() bool {
+	return len(p.Services) > 0
+}
+
+func (p *Peer) loopbackN() int {
+	if p.N != 0 {
+		return p.N
+	}
+	return p.SelfN
+}
+
+func (p *Peer) loopbackIP() net.IP {
+	if p.LoopbackIP != "" {
+		return net.ParseIP(p.LoopbackIP).To4()
+	}
+	if n := p.loopbackN(); n > 0 {
+		return net.IPv4(127, 77, 0, byte(n))
+	}
+	return nil
+}
+
+func (p *Peer) listenIP() net.IP {
+	if ip := p.loopbackIP(); ip != nil {
+		return ip
+	}
+	return net.IPv4(127, 0, 0, 1)
+}
+
+type streamRoute struct {
+	HeaderKey  int
+	Service    string
+	ListenIP   net.IP
+	ListenPort int
+	LocalIP    net.IP
+	LocalPort  int
+	SourceIP   net.IP
+}
+
+func (p *Peer) routes() []streamRoute {
+	if p.usesServices() {
+		services := append([]PeerService(nil), p.Services...)
+		sort.Slice(services, func(i, j int) bool { return services[i].Slot < services[j].Slot })
+		out := make([]streamRoute, 0, len(services))
+		for _, svc := range services {
+			out = append(out, streamRoute{
+				HeaderKey:  svc.Slot,
+				Service:    svc.Service,
+				ListenIP:   p.listenIP(),
+				ListenPort: svc.port(),
+				LocalIP:    p.listenIP(),
+				LocalPort:  svc.port(),
+				SourceIP:   p.loopbackIP(),
+			})
+		}
+		return out
+	}
+	out := make([]streamRoute, 0, len(p.Ports))
+	for _, port := range p.Ports {
+		out = append(out, streamRoute{
+			HeaderKey:  port,
+			ListenIP:   p.listenIP(),
+			ListenPort: port,
+			LocalIP:    net.IPv4(127, 0, 0, 1),
+			LocalPort:  port,
+			SourceIP:   p.loopbackIP(),
+		})
+	}
+	return out
+}
+
+func buildForwardRoutes(self, peer Peer) ([]streamRoute, error) {
+	selfRoutes := self.routes()
+	peerRoutes := peer.routes()
+	if len(selfRoutes) != len(peerRoutes) {
+		return nil, fmt.Errorf("route-count mismatch: self has %d routes, peer has %d", len(selfRoutes), len(peerRoutes))
+	}
+	if !self.usesServices() && !peer.usesServices() {
+		out := make([]streamRoute, 0, len(peerRoutes))
+		for i, peerRoute := range peerRoutes {
+			selfRoute := selfRoutes[i]
+			peerRoute.LocalIP = selfRoute.LocalIP
+			peerRoute.LocalPort = selfRoute.LocalPort
+			peerRoute.SourceIP = selfRoute.SourceIP
+			out = append(out, peerRoute)
+		}
+		return out, nil
+	}
+	byKey := map[int]streamRoute{}
+	for _, r := range selfRoutes {
+		byKey[r.HeaderKey] = r
+	}
+	out := make([]streamRoute, 0, len(peerRoutes))
+	for _, peerRoute := range peerRoutes {
+		selfRoute, ok := byKey[peerRoute.HeaderKey]
+		if !ok {
+			return nil, fmt.Errorf("peer route %d has no matching self route", peerRoute.HeaderKey)
+		}
+		peerRoute.LocalIP = selfRoute.LocalIP
+		peerRoute.LocalPort = selfRoute.LocalPort
+		peerRoute.SourceIP = selfRoute.SourceIP
+		out = append(out, peerRoute)
+	}
+	return out, nil
 }
 
 type Config struct {
@@ -107,6 +231,7 @@ type Config struct {
 	ClusterCAPEMPath  string
 	LeafCertPath      string
 	LeafKeyPath       string
+	HealthAddr        string
 }
 
 const (
@@ -117,6 +242,7 @@ const (
 	turnProviderCoturn       = "coturn"
 	turnProviderCloudflare   = "cloudflare-calls"
 	defaultTurnCredentialURL = "https://mesh-signal.teesql.com/turn-credentials"
+	defaultHealthAddr        = "127.0.0.1:8086"
 )
 
 func loadConfig() *Config {
@@ -150,6 +276,7 @@ func loadConfig() *Config {
 		ClusterCAPEMPath:  envDefault("TEESQL_CLUSTER_CA_PEM_PATH", defaultClusterCAPEMPath),
 		LeafCertPath:      envDefault("TEESQL_LEAF_CERT_PATH", defaultLeafCertPath),
 		LeafKeyPath:       envDefault("TEESQL_LEAF_KEY_PATH", defaultLeafKeyPath),
+		HealthAddr:        envDefault("MESH_CONN_HEALTH_ADDR", defaultHealthAddr),
 	}
 	switch cfg.TurnProvider {
 	case turnProviderCoturn:
@@ -226,14 +353,17 @@ func readTurnSecret() string {
 // because a peer's PEERS_JSON is shared with every other peer's
 // configuration and must round-trip identically across the cluster.
 func validatePeers(cfg *Config) error {
-	if len(cfg.Peers) < 2 {
-		return fmt.Errorf("need at least 2 peers in PEERS_JSON, got %d", len(cfg.Peers))
+	if len(cfg.Peers) < 1 {
+		return fmt.Errorf("need at least 1 peer in PEERS_JSON, got %d", len(cfg.Peers))
 	}
 
 	seenIDs := map[string]bool{}
 	allPorts := map[int]string{} // port -> peer.ID owning it (for collision detection)
-	expectedPortCount := -1
+	expectedRouteCount := -1
+	expectedSlots := map[int]string{}
 	selfFound := false
+	serviceMode := false
+	legacyMode := false
 
 	for i, p := range cfg.Peers {
 		if p.ID == "" {
@@ -246,20 +376,63 @@ func validatePeers(cfg *Config) error {
 		if p.ID == cfg.SelfID {
 			selfFound = true
 		}
+		if n := p.loopbackN(); n < 0 || n > 255 {
+			return fmt.Errorf("peer %q loopback n=%d is out of range", p.ID, n)
+		}
 
+		if len(p.Ports) > 0 && len(p.Services) > 0 {
+			return fmt.Errorf("peer %q cannot set both ports and services", p.ID)
+		}
+
+		if len(p.Services) > 0 {
+			serviceMode = true
+			if ip := p.loopbackIP(); ip == nil || !ip.IsLoopback() {
+				return fmt.Errorf("peer %q services require n/self_n or loopback_ip in 127.0.0.0/8", p.ID)
+			}
+			if expectedRouteCount < 0 {
+				expectedRouteCount = len(p.Services)
+			} else if len(p.Services) != expectedRouteCount {
+				return fmt.Errorf("peer %q has %d services, expected %d (every peer must expose the same service slots)",
+					p.ID, len(p.Services), expectedRouteCount)
+			}
+			seenSlots := map[int]bool{}
+			for j, svc := range p.Services {
+				if svc.Slot < 0 || svc.Slot > 65535 {
+					return fmt.Errorf("peer %q services[%d].slot=%d is out of range", p.ID, j, svc.Slot)
+				}
+				if svc.Service == "" {
+					return fmt.Errorf("peer %q services[%d] has empty service", p.ID, j)
+				}
+				port := svc.port()
+				if port <= 0 || port > 65535 {
+					return fmt.Errorf("peer %q services[%d] port=%d is out of range", p.ID, j, port)
+				}
+				if seenSlots[svc.Slot] {
+					return fmt.Errorf("peer %q has duplicate service slot %d", p.ID, svc.Slot)
+				}
+				seenSlots[svc.Slot] = true
+				if want, ok := expectedSlots[svc.Slot]; ok && want != svc.Service {
+					return fmt.Errorf("peer %q service slot %d is %q, expected %q", p.ID, svc.Slot, svc.Service, want)
+				}
+				expectedSlots[svc.Slot] = svc.Service
+			}
+			continue
+		}
+
+		legacyMode = true
 		if len(p.Ports) == 0 {
 			return fmt.Errorf("peer %q has empty Ports list", p.ID)
 		}
-		if expectedPortCount < 0 {
-			expectedPortCount = len(p.Ports)
-		} else if len(p.Ports) != expectedPortCount {
+		if expectedRouteCount < 0 {
+			expectedRouteCount = len(p.Ports)
+		} else if len(p.Ports) != expectedRouteCount {
 			return fmt.Errorf("peer %q has %d ports, expected %d (every peer's port-list must have the same length — index i is the same protocol slot across peers)",
-				p.ID, len(p.Ports), expectedPortCount)
+				p.ID, len(p.Ports), expectedRouteCount)
 		}
 
-		// Each port must be unique cluster-wide: mesh-conn binds OTHER
-		// peers' ports on 127.0.0.1, so two peers can't share a port
-		// number or one would shadow the other.
+		// Legacy mode binds all peer identity ports on 127.0.0.1 unless
+		// loopback IPs are supplied, so the old PEERS_JSON shape still
+		// requires globally unique ports.
 		seenSelf := map[int]bool{}
 		for j, port := range p.Ports {
 			if port <= 0 || port > 65535 {
@@ -280,13 +453,21 @@ func validatePeers(cfg *Config) error {
 	if !selfFound {
 		return fmt.Errorf("PEER_ID %q not in PEERS_JSON (peers: %v)", cfg.SelfID, knownIDs(cfg.Peers))
 	}
+	if serviceMode && legacyMode {
+		return fmt.Errorf("PEERS_JSON cannot mix services entries with legacy ports entries")
+	}
 
 	// Log a digest of the validated config so operators can check that
 	// every peer in the cluster sees the same PEERS_JSON. Differences
 	// across peers would indicate a deploy-script discrepancy.
 	digest := peersDigest(cfg.Peers)
-	log.Printf("PEERS_JSON validated: %d peers, %d ports each, digest=%s",
-		len(cfg.Peers), expectedPortCount, digest)
+	if serviceMode {
+		log.Printf("PEERS_JSON validated: %d peers, %d services each, digest=%s",
+			len(cfg.Peers), expectedRouteCount, digest)
+	} else {
+		log.Printf("PEERS_JSON validated: %d peers, %d ports each, digest=%s",
+			len(cfg.Peers), expectedRouteCount, digest)
+	}
 	return nil
 }
 
@@ -319,8 +500,14 @@ func peersDigest(peers []Peer) string {
 		// find peer
 		for _, p := range peers {
 			if p.ID == id {
-				for _, port := range p.Ports {
-					fmt.Fprintf(&buf, "%d,", port)
+				if p.usesServices() {
+					for _, r := range p.routes() {
+						fmt.Fprintf(&buf, "%d=%s:%d@%s,", r.HeaderKey, r.Service, r.ListenPort, r.ListenIP)
+					}
+				} else {
+					for _, port := range p.Ports {
+						fmt.Fprintf(&buf, "%d,", port)
+					}
 				}
 				break
 			}
@@ -357,6 +544,116 @@ func envDefault(k, def string) string {
 }
 
 // =============================================================================
+// health
+// =============================================================================
+
+type healthState struct {
+	selfIP        net.IP
+	peerCount     int
+	now           func() time.Time
+	canBind       func(net.IP) bool
+	lastHandshake atomic.Int64
+}
+
+func newHealthState(self *Peer, peerCount int) *healthState {
+	h := &healthState{
+		peerCount: peerCount,
+		now:       time.Now,
+		canBind:   canBindLoopbackIP,
+	}
+	if self != nil {
+		h.selfIP = self.loopbackIP()
+	}
+	return h
+}
+
+func (h *healthState) recordHandshake() {
+	if h != nil {
+		h.lastHandshake.Store(h.now().Unix())
+	}
+}
+
+func canBindLoopbackIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: ip, Port: 0})
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+func (h *healthState) healthy() (bool, string) {
+	if h == nil {
+		return false, "health state not initialized"
+	}
+	if h.selfIP == nil {
+		return false, "self loopback IP is not configured"
+	}
+	if !h.canBind(h.selfIP) {
+		return false, "self loopback IP is not bindable"
+	}
+	if h.peerCount == 0 {
+		return true, "ok"
+	}
+	last := h.lastHandshake.Load()
+	if last == 0 {
+		return false, "no peer handshake completed"
+	}
+	age := h.now().Sub(time.Unix(last, 0))
+	if age > 60*time.Second {
+		return false, "last peer handshake is stale"
+	}
+	return true, "ok"
+}
+
+func (h *healthState) handler(w http.ResponseWriter, _ *http.Request) {
+	ok, reason := h.healthy()
+	status := http.StatusOK
+	if !ok {
+		status = http.StatusServiceUnavailable
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	last := h.lastHandshake.Load()
+	resp := map[string]any{
+		"ok":                      ok,
+		"reason":                  reason,
+		"self_loopback_ip":        "",
+		"peer_count":              h.peerCount,
+		"last_handshake_unix":     last,
+		"handshake_fresh_seconds": 60,
+		"self_loopback_bindable":  h.selfIP != nil && h.canBind(h.selfIP),
+	}
+	if h.selfIP != nil {
+		resp["self_loopback_ip"] = h.selfIP.String()
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func startHealthServer(addr string, h *healthState) {
+	if addr == "" {
+		log.Printf("health server disabled")
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", h.handler)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("health listen %s: %v", addr, err)
+		return
+	}
+	log.Printf("health listening on %s", ln.Addr())
+	go func() {
+		if err := http.Serve(ln, mux); err != nil && err != http.ErrServerClosed {
+			log.Printf("health server: %v", err)
+		}
+	}()
+}
+
+// =============================================================================
 // main
 // =============================================================================
 
@@ -377,16 +674,24 @@ func main() {
 			others = append(others, p)
 		}
 	}
-	log.Printf("mesh-conn: self=%s ports=%v other=%d", cfg.SelfID, self.Ports, len(others))
+	health := newHealthState(self, len(others))
+	startHealthServer(cfg.HealthAddr, health)
+
+	log.Printf("mesh-conn: self=%s routes=%d other=%d", cfg.SelfID, len(self.routes()), len(others))
 
 	go pollLoop(cfg)
+
+	if len(others) == 0 {
+		log.Printf("single-peer PEERS_JSON: no peer links to start")
+		select {}
+	}
 
 	var wg sync.WaitGroup
 	for _, p := range others {
 		wg.Add(1)
 		go func(p Peer) {
 			defer wg.Done()
-			runPeerLink(cfg, *self, p)
+			runPeerLink(cfg, *self, p, health)
 		}(p)
 	}
 	wg.Wait()
@@ -397,9 +702,9 @@ func main() {
 // per-peer link: ICE conn + bound UDP socket on peer's identity port
 // =============================================================================
 
-func runPeerLink(cfg *Config, self, peer Peer) {
+func runPeerLink(cfg *Config, self, peer Peer, health *healthState) {
 	for {
-		if err := dialAndPump(cfg, self, peer); err != nil {
+		if err := dialAndPump(cfg, self, peer, health); err != nil {
 			deleteSession(peer.ID)
 			log.Printf("[%s] link failed: %v — retrying in 5s", peer.ID, err)
 			time.Sleep(5 * time.Second)
@@ -414,9 +719,10 @@ func runPeerLink(cfg *Config, self, peer Peer) {
 // Stream header layout: 3 bytes per stream open.
 //
 //	byte 0 = tag (streamUDP or streamTCP)
-//	bytes 1-2 = receiver-side port (big-endian uint16) — the port number
-//	  the receiver itself binds locally; receiver looks it up in its own
-//	  Ports list to find the index/protocol slot
+//	bytes 1-2 = route key (big-endian uint16). Legacy PEERS_JSON uses the
+//	  receiver-side identity port. Service-map PEERS_JSON uses the service
+//	  slot, so the receiver dispatches by slot and dials its local service
+//	  port on 127.77.0.<self_n>.
 const (
 	streamUDP byte = 0x55 // long-lived per-port UDP datagram pipe
 	streamTCP byte = 0x33 // per-conn TCP byte-stream forwarder
@@ -452,9 +758,10 @@ func durationEnv(name string, def time.Duration) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-func dialAndPump(cfg *Config, self, peer Peer) error {
-	if len(self.Ports) != len(peer.Ports) {
-		return fmt.Errorf("port-count mismatch: self has %d ports, peer has %d", len(self.Ports), len(peer.Ports))
+func dialAndPump(cfg *Config, self, peer Peer, health *healthState) error {
+	routes, err := buildForwardRoutes(self, peer)
+	if err != nil {
+		return err
 	}
 
 	// 1. Establish ICE + wrap with a counting conn for byte-level telemetry.
@@ -515,18 +822,20 @@ func dialAndPump(cfg *Config, self, peer Peer) error {
 	go reportLinkStats(peer.ID, counted, stopStats)
 	defer close(stopStats)
 
-	// 3. Bind localhost UDP+TCP listeners for every one of peer's ports.
-	udpSocks := make([]*net.UDPConn, len(peer.Ports))
-	tcpListeners := make([]*net.TCPListener, len(peer.Ports))
-	for i, port := range peer.Ports {
-		udpSocks[i], err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+	// 3. Bind UDP+TCP listeners for every one of peer's routes. New
+	// service-map configs bind on the target peer's 127.77.0.<n> IP so
+	// common service ports such as 5432 can be reused per peer.
+	udpSocks := make([]*net.UDPConn, len(routes))
+	tcpListeners := make([]*net.TCPListener, len(routes))
+	for i, route := range routes {
+		udpSocks[i], err = net.ListenUDP("udp", &net.UDPAddr{IP: route.ListenIP, Port: route.ListenPort})
 		if err != nil {
-			return fmt.Errorf("udp listen 127.0.0.1:%d: %w", port, err)
+			return fmt.Errorf("udp listen %s:%d: %w", route.ListenIP, route.ListenPort, err)
 		}
 		defer udpSocks[i].Close()
-		tcpListeners[i], err = net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+		tcpListeners[i], err = net.ListenTCP("tcp", &net.TCPAddr{IP: route.ListenIP, Port: route.ListenPort})
 		if err != nil {
-			return fmt.Errorf("tcp listen 127.0.0.1:%d: %w", port, err)
+			return fmt.Errorf("tcp listen %s:%d: %w", route.ListenIP, route.ListenPort, err)
 		}
 		defer tcpListeners[i].Close()
 	}
@@ -535,21 +844,21 @@ func dialAndPump(cfg *Config, self, peer Peer) error {
 	//    them eagerly, server's accept loop populates them as headers
 	//    arrive. Both sides also run an accept loop to handle ad-hoc
 	//    incoming TCP streams.
-	udpStreams := make([]*quic.Stream, len(peer.Ports))
+	udpStreams := make([]*quic.Stream, len(routes))
 	allUDPReady := make(chan struct{})
-	errCh := make(chan error, 4*len(peer.Ports))
+	errCh := make(chan error, 4*len(routes))
 
 	go func() {
 		errCh <- runAcceptLoop(connCtx, qconn, &self, &peer, udpStreams, allUDPReady)
 	}()
 
 	if isClient {
-		for i, peerPort := range peer.Ports {
+		for i, route := range routes {
 			s, err := qconn.OpenStreamSync(connCtx)
 			if err != nil {
 				return fmt.Errorf("quic OpenStreamSync: %w", err)
 			}
-			hdr := []byte{streamUDP, byte(peerPort >> 8), byte(peerPort & 0xff)}
+			hdr := []byte{streamUDP, byte(route.HeaderKey >> 8), byte(route.HeaderKey & 0xff)}
 			if _, err := s.Write(hdr); err != nil {
 				return fmt.Errorf("quic write hdr: %w", err)
 			}
@@ -565,21 +874,21 @@ func dialAndPump(cfg *Config, self, peer Peer) error {
 		}
 	}
 
-	log.Printf("[%s] link up — %d ports forwarded (udp+tcp), peer reachable via ICE",
-		peer.ID, len(peer.Ports))
+	health.recordHandshake()
+	log.Printf("[%s] link up — %d routes forwarded (udp+tcp), peer reachable via ICE",
+		peer.ID, len(routes))
 
 	// 5. Start pumps for each port.
-	for i := range peer.Ports {
+	for i := range routes {
 		i := i
-		selfPort := self.Ports[i]
+		route := routes[i]
 		go func() { errCh <- pumpUDPSockToStream(udpSocks[i], udpStreams[i]) }()
 		go func() {
-			udpDst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: selfPort}
+			udpDst := &net.UDPAddr{IP: route.LocalIP, Port: route.LocalPort}
 			errCh <- pumpUDPStreamToSock(udpStreams[i], udpSocks[i], udpDst)
 		}()
 		go func() {
-			peerPort := peer.Ports[i]
-			errCh <- acceptLocalTCP(connCtx, tcpListeners[i], qconn, peerPort)
+			errCh <- acceptLocalTCP(connCtx, tcpListeners[i], qconn, route.HeaderKey)
 		}()
 	}
 	return <-errCh
@@ -591,7 +900,8 @@ func dialAndPump(cfg *Config, self, peer Peer) error {
 // corresponding local TCP service.
 func runAcceptLoop(ctx context.Context, qconn *quic.Conn, self, peer *Peer, udpStreams []*quic.Stream, allUDPReady chan struct{}) error {
 	udpRegisteredCount := 0
-	udpRegisteredOnce := make([]bool, len(self.Ports))
+	selfRoutes := self.routes()
+	udpRegisteredOnce := make([]bool, len(selfRoutes))
 	for {
 		s, err := qconn.AcceptStream(ctx)
 		if err != nil {
@@ -604,27 +914,31 @@ func runAcceptLoop(ctx context.Context, qconn *quic.Conn, self, peer *Peer, udpS
 			continue
 		}
 		tag := hdr[0]
-		port := int(hdr[1])<<8 | int(hdr[2])
-		// "port" is the receiver-side port — we look it up in our own ports.
-		idx := self.hasPort(port)
+		routeKey := int(hdr[1])<<8 | int(hdr[2])
+		idx := self.hasRouteKey(routeKey)
 		if idx < 0 {
-			log.Printf("[%s] stream for unknown self-port %d", peer.ID, port)
+			log.Printf("[%s] stream for unknown self route %d", peer.ID, routeKey)
 			s.CancelRead(0)
 			s.Close()
 			continue
 		}
+		route := selfRoutes[idx]
 		switch tag {
 		case streamUDP:
 			udpStreams[idx] = s
 			if !udpRegisteredOnce[idx] {
 				udpRegisteredOnce[idx] = true
 				udpRegisteredCount++
-				if udpRegisteredCount == len(self.Ports) {
+				if udpRegisteredCount == len(selfRoutes) {
 					close(allUDPReady)
 				}
 			}
 		case streamTCP:
-			go handleIncomingTCP(s, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+			var src *net.TCPAddr
+			if route.SourceIP != nil {
+				src = &net.TCPAddr{IP: route.SourceIP}
+			}
+			go handleIncomingTCP(s, src, &net.TCPAddr{IP: route.LocalIP, Port: route.LocalPort})
 		default:
 			log.Printf("[%s] unknown stream tag 0x%x", peer.ID, tag)
 			s.CancelRead(0)
@@ -633,9 +947,9 @@ func runAcceptLoop(ctx context.Context, qconn *quic.Conn, self, peer *Peer, udpS
 	}
 }
 
-func handleIncomingTCP(s *quic.Stream, dst *net.TCPAddr) {
+func handleIncomingTCP(s *quic.Stream, src, dst *net.TCPAddr) {
 	defer s.Close()
-	c, err := net.DialTCP("tcp", nil, dst)
+	c, err := net.DialTCP("tcp", src, dst)
 	if err != nil {
 		log.Printf("dial local %s: %v", dst, err)
 		return
