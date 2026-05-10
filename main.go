@@ -41,6 +41,7 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/hmac"
@@ -52,6 +53,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -61,6 +63,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -91,12 +94,19 @@ func (p *Peer) hasPort(port int) int {
 }
 
 type Config struct {
-	SelfID       string
-	Peers        []Peer
-	SignalingURL string
-	TurnHost     string
-	TurnSecret   string
+	SelfID           string
+	Peers            []Peer
+	SignalingURL     string
+	TurnHost         string
+	TurnSecret       string
+	ClusterCAPEMPath string
+	ClusterCAKeyPath string
 }
+
+const (
+	defaultClusterCAPEMPath = "/teesql-shared/cluster-ca.pem"
+	defaultClusterCAKeyPath = "/teesql-shared/cluster-ca.key"
+)
 
 func loadConfig() *Config {
 	// Stage-4 sources of truth, with fallback to stage-1 envs so this
@@ -114,10 +124,12 @@ func loadConfig() *Config {
 	//     update path (verified in disk-persistence shakedown).
 
 	cfg := &Config{
-		SelfID:       readSelfID(),
-		SignalingURL: strings.TrimRight(mustEnv("SIGNALING_URL"), "/"),
-		TurnHost:     os.Getenv("TURN_HOST"),
-		TurnSecret:   readTurnSecret(),
+		SelfID:           readSelfID(),
+		SignalingURL:     strings.TrimRight(mustEnv("SIGNALING_URL"), "/"),
+		TurnHost:         os.Getenv("TURN_HOST"),
+		TurnSecret:       readTurnSecret(),
+		ClusterCAPEMPath: envDefault("TEESQL_CLUSTER_CA_PEM_PATH", defaultClusterCAPEMPath),
+		ClusterCAKeyPath: envDefault("TEESQL_CLUSTER_CA_KEY_PATH", defaultClusterCAKeyPath),
 	}
 	if err := json.Unmarshal([]byte(mustEnv("PEERS_JSON")), &cfg.Peers); err != nil {
 		log.Fatalf("PEERS_JSON: %v", err)
@@ -149,13 +161,13 @@ func readSelfID() string {
 
 // readTurnSecret resolves the TURN shared secret in priority order:
 //
-//   1. TURN_SHARED_SECRET env (set when using an external coturn whose
-//      static-auth-secret was configured out-of-band — e.g. the Vultr
-//      coordinator path). When this is present it MUST win, because
-//      the local TEE-derived value won't match what coturn is checking
-//      against.
-//   2. /run/secrets/turn (stage-4 TEE-derived path; matches the
-//      embedded coordinator's coturn which reads the same file).
+//  1. TURN_SHARED_SECRET env (set when using an external coturn whose
+//     static-auth-secret was configured out-of-band — e.g. the Vultr
+//     coordinator path). When this is present it MUST win, because
+//     the local TEE-derived value won't match what coturn is checking
+//     against.
+//  2. /run/secrets/turn (stage-4 TEE-derived path; matches the
+//     embedded coordinator's coturn which reads the same file).
 //
 // Order matters: env beats file so that "use external coturn" can be
 // configured purely at the cluster.tf layer.
@@ -302,6 +314,14 @@ func mustEnv(k string) string {
 	return v
 }
 
+func envDefault(k, def string) string {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	return v
+}
+
 // =============================================================================
 // main
 // =============================================================================
@@ -340,20 +360,23 @@ func main() {
 func runPeerLink(cfg *Config, self, peer Peer) {
 	for {
 		if err := dialAndPump(cfg, self, peer); err != nil {
+			deleteSession(peer.ID)
 			log.Printf("[%s] link failed: %v — retrying in 5s", peer.ID, err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 		// dialAndPump returns nil only when the conn closed cleanly.
+		deleteSession(peer.ID)
 		log.Printf("[%s] link closed — reconnecting", peer.ID)
 	}
 }
 
 // Stream header layout: 3 bytes per stream open.
-//   byte 0 = tag (streamUDP or streamTCP)
-//   bytes 1-2 = receiver-side port (big-endian uint16) — the port number
-//     the receiver itself binds locally; receiver looks it up in its own
-//     Ports list to find the index/protocol slot
+//
+//	byte 0 = tag (streamUDP or streamTCP)
+//	bytes 1-2 = receiver-side port (big-endian uint16) — the port number
+//	  the receiver itself binds locally; receiver looks it up in its own
+//	  Ports list to find the index/protocol slot
 const (
 	streamUDP byte = 0x55 // long-lived per-port UDP datagram pipe
 	streamTCP byte = 0x33 // per-conn TCP byte-stream forwarder
@@ -367,13 +390,26 @@ const (
 // arrives in this long, the conn errors out.
 func quicConfig() *quic.Config {
 	return &quic.Config{
-		KeepAlivePeriod:                10 * time.Second,
-		MaxIdleTimeout:                 60 * time.Second,
+		KeepAlivePeriod:                durationEnv("MESH_CONN_QUIC_KEEPALIVE_SECONDS", 10*time.Second),
+		MaxIdleTimeout:                 durationEnv("MESH_CONN_QUIC_MAX_IDLE_SECONDS", 60*time.Second),
 		InitialStreamReceiveWindow:     4 << 20,
 		MaxStreamReceiveWindow:         16 << 20,
 		InitialConnectionReceiveWindow: 8 << 20,
 		MaxConnectionReceiveWindow:     32 << 20,
 	}
+}
+
+func durationEnv(name string, def time.Duration) time.Duration {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds <= 0 {
+		log.Printf("WARN ignoring invalid %s=%q", name, raw)
+		return def
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func dialAndPump(cfg *Config, self, peer Peer) error {
@@ -402,7 +438,8 @@ func dialAndPump(cfg *Config, self, peer Peer) error {
 	isClient := cfg.SelfID < peer.ID
 	connCtx, connCancel := context.WithCancel(context.Background())
 	defer connCancel()
-	dialCtx, dialCancel := context.WithTimeout(connCtx, 30*time.Second)
+	handshakeTimeout := durationEnv("MESH_CONN_QUIC_HANDSHAKE_SECONDS", 30*time.Second)
+	dialCtx, dialCancel := context.WithTimeout(connCtx, handshakeTimeout)
 	defer dialCancel()
 
 	var qconn *quic.Conn
@@ -410,18 +447,18 @@ func dialAndPump(cfg *Config, self, peer Peer) error {
 		// remote net.Addr is ignored by our PacketConn shim (it only
 		// knows about the one ICE peer); we still pass something non-nil
 		// because quic.Dial uses it for SNI fallback / connection ID.
-		qconn, err = quic.Dial(dialCtx, pkt, counted.RemoteAddr(), clientTLS(), quicConfig())
+		qconn, err = quic.Dial(dialCtx, pkt, counted.RemoteAddr(), clientTLS(cfg), quicConfig())
 		if err != nil {
 			return fmt.Errorf("quic dial: %w", err)
 		}
 	} else {
-		ln, lerr := quic.Listen(pkt, serverTLS(), quicConfig())
+		ln, lerr := quic.Listen(pkt, serverTLS(cfg), quicConfig())
 		if lerr != nil {
 			return fmt.Errorf("quic listen: %w", lerr)
 		}
 		// Close the listener once we have our one accepted conn — we
 		// only want a single QUIC connection per ICE pair.
-		acceptCtx, acceptCancel := context.WithTimeout(connCtx, 30*time.Second)
+		acceptCtx, acceptCancel := context.WithTimeout(connCtx, handshakeTimeout)
 		qconn, err = ln.Accept(acceptCtx)
 		acceptCancel()
 		ln.Close()
@@ -741,46 +778,136 @@ func reportLinkStats(peerID string, conn *countingConn, stop <-chan struct{}) {
 }
 
 // =============================================================================
-// TLS — QUIC requires a TLS handshake. We don't rely on its identity
-// guarantees (mesh peers are already authenticated by the dstack TEE
-// layer + the TURN HMAC secret); a self-signed cert with no verification
-// is fine here. We accept any peer cert because trust is established
-// out-of-band before ICE even starts.
+// TLS — QUIC requires a TLS handshake. TeeSQL pins this layer to the
+// cluster CA so TURN/signaling infrastructure cannot impersonate a peer.
 // =============================================================================
 
 const quicALPN = "dstack-mesh-conn"
 
-func clientTLS() *tls.Config {
+func clientTLS(cfg *Config) *tls.Config {
+	_, roots, err := loadClusterCA(cfg.ClusterCAPEMPath)
+	if err != nil {
+		log.Fatalf("cluster CA root: %v", err)
+	}
+	cert := meshTLSCertificate(cfg)
 	return &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{quicALPN},
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      roots,
+		ServerName:   "mesh-conn",
+		NextProtos:   []string{quicALPN},
+		MinVersion:   tls.VersionTLS13,
 	}
 }
 
-func serverTLS() *tls.Config {
+func serverTLS(cfg *Config) *tls.Config {
+	_, roots, err := loadClusterCA(cfg.ClusterCAPEMPath)
+	if err != nil {
+		log.Fatalf("cluster CA root: %v", err)
+	}
+	cert := meshTLSCertificate(cfg)
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    roots,
+		NextProtos:   []string{quicALPN},
+		MinVersion:   tls.VersionTLS13,
+	}
+}
+
+func meshTLSCertificate(cfg *Config) tls.Certificate {
+	ca, err := loadClusterCACert(cfg.ClusterCAPEMPath)
+	if err != nil {
+		log.Fatalf("cluster CA cert: %v", err)
+	}
+	caKey, err := loadClusterCAKey(cfg.ClusterCAKeyPath)
+	if err != nil {
+		log.Fatalf("cluster CA key: %v", err)
+	}
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		log.Fatalf("ecdsa keygen: %v", err)
 	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "mesh-conn"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialLimit)
 	if err != nil {
-		log.Fatalf("self-signed cert: %v", err)
+		log.Fatalf("serial generation: %v", err)
 	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{{
-			Certificate: [][]byte{der},
-			PrivateKey:  priv,
-		}},
-		NextProtos: []string{quicALPN},
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: cfg.SelfID},
+		DNSNames:     []string{"mesh-conn"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &priv.PublicKey, caKey)
+	if err != nil {
+		log.Fatalf("cluster-CA-signed cert: %v", err)
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  priv,
+	}
+}
+
+func loadClusterCA(path string) (*x509.Certificate, *x509.CertPool, error) {
+	cert, err := loadClusterCACert(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return cert, pool, nil
+}
+
+func loadClusterCACert(path string) (*x509.Certificate, error) {
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	block, rest := pem.Decode(pemBytes)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, fmt.Errorf("%s: missing CERTIFICATE PEM block", path)
+	}
+	if extra, _ := pem.Decode(rest); extra != nil {
+		return nil, fmt.Errorf("%s: expected a single CERTIFICATE PEM block", path)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if !cert.IsCA {
+		return nil, fmt.Errorf("%s: certificate is not a CA", path)
+	}
+	return cert, nil
+}
+
+func loadClusterCAKey(path string) (crypto.Signer, error) {
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, fmt.Errorf("%s: missing private key PEM block", path)
+	}
+	for _, parse := range []func([]byte) (any, error){
+		func(b []byte) (any, error) { return x509.ParsePKCS8PrivateKey(b) },
+		func(b []byte) (any, error) { return x509.ParseECPrivateKey(b) },
+		func(b []byte) (any, error) { return x509.ParsePKCS1PrivateKey(b) },
+	} {
+		key, err := parse(block.Bytes)
+		if err != nil {
+			continue
+		}
+		signer, ok := key.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("%s: private key is not a signer", path)
+		}
+		return signer, nil
+	}
+	return nil, fmt.Errorf("%s: unsupported private key format", path)
 }
 
 // =============================================================================
@@ -822,6 +949,41 @@ func installSession(remoteID string, agent *ice.Agent) *peerSession {
 	return s
 }
 
+func drainAuthCh(ch chan [2]string) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+func deleteSession(remoteID string) {
+	sessionsMu.Lock()
+	sess := sessions[remoteID]
+	if sess == nil {
+		sessionsMu.Unlock()
+		return
+	}
+	drainAuthCh(sess.authCh)
+	delete(sessions, remoteID)
+	sessionsMu.Unlock()
+	if sess.agent != nil {
+		_ = sess.agent.Close()
+	}
+}
+
+func deleteSessionIfCurrent(remoteID string, sess *peerSession) {
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+	if sessions[remoteID] != sess {
+		return
+	}
+	drainAuthCh(sess.authCh)
+	delete(sessions, remoteID)
+}
+
 func dialICE(cfg *Config, remoteID string) (*ice.Conn, error) {
 	var urls []*stun.URI
 	if cfg.TurnHost != "" {
@@ -848,9 +1010,11 @@ func dialICE(cfg *Config, remoteID string) (*ice.Conn, error) {
 		candidateTypes = []ice.CandidateType{ice.CandidateTypeRelay}
 	}
 	agent, err := ice.NewAgent(&ice.AgentConfig{
-		Urls:           urls,
-		NetworkTypes:   []ice.NetworkType{ice.NetworkTypeUDP4, ice.NetworkTypeTCP4},
-		CandidateTypes: candidateTypes,
+		Urls:            urls,
+		NetworkTypes:    []ice.NetworkType{ice.NetworkTypeUDP4, ice.NetworkTypeTCP4},
+		CandidateTypes:  candidateTypes,
+		IPFilter:        iceIPFilter(),
+		IncludeLoopback: os.Getenv("MESH_CONN_LOOPBACK_ONLY") == "1",
 	})
 	if err != nil {
 		return nil, fmt.Errorf("NewAgent: %w", err)
@@ -873,44 +1037,86 @@ func dialICE(cfg *Config, remoteID string) (*ice.Conn, error) {
 		_ = agent.Close()
 	}
 
+	var candidateMu sync.Mutex
+	localCandidates := []string{}
 	if err := agent.OnCandidate(func(c ice.Candidate) {
 		if c == nil {
 			return
 		}
-		publish(cfg, remoteID, "candidate", c.Marshal())
+		candidate := c.Marshal()
+		candidateMu.Lock()
+		localCandidates = append(localCandidates, candidate)
+		candidateMu.Unlock()
+		publish(cfg, remoteID, "candidate", candidate)
 	}); err != nil {
 		closeAgent()
 		return nil, err
 	}
 	if err := agent.OnConnectionStateChange(func(s ice.ConnectionState) {
 		log.Printf("[%s] ice state: %s", remoteID, s)
-		if s == ice.ConnectionStateFailed || s == ice.ConnectionStateClosed {
+		if s == ice.ConnectionStateDisconnected || s == ice.ConnectionStateFailed || s == ice.ConnectionStateClosed {
+			deleteSessionIfCurrent(remoteID, sess)
 			cancelDial()
 		}
 	}); err != nil {
+		deleteSessionIfCurrent(remoteID, sess)
 		closeAgent()
 		return nil, err
 	}
 
 	localUfrag, localPwd, err := agent.GetLocalUserCredentials()
 	if err != nil {
+		deleteSessionIfCurrent(remoteID, sess)
 		closeAgent()
 		return nil, err
 	}
-	publish(cfg, remoteID, "auth", localUfrag+":"+localPwd)
+	authPayload := localUfrag + ":" + localPwd
+	publish(cfg, remoteID, "auth", authPayload)
 
 	if err := agent.GatherCandidates(); err != nil {
+		deleteSessionIfCurrent(remoteID, sess)
 		closeAgent()
 		return nil, err
 	}
 
-	var remote [2]string
-	select {
-	case remote = <-sess.authCh:
-	case <-time.After(60 * time.Second):
-		closeAgent()
-		return nil, fmt.Errorf("timeout waiting for remote auth from %s", remoteID)
+	publishAuthAndCandidates := func() {
+		publish(cfg, remoteID, "auth", authPayload)
+		candidateMu.Lock()
+		candidates := append([]string(nil), localCandidates...)
+		candidateMu.Unlock()
+		for _, candidate := range candidates {
+			publish(cfg, remoteID, "candidate", candidate)
+		}
 	}
+	stopRepublish := make(chan struct{})
+	defer close(stopRepublish)
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopRepublish:
+				return
+			case <-t.C:
+				publishAuthAndCandidates()
+			}
+		}
+	}()
+
+	var remote [2]string
+	authTimeout := time.NewTimer(60 * time.Second)
+	defer authTimeout.Stop()
+	for {
+		select {
+		case remote = <-sess.authCh:
+			goto haveRemoteAuth
+		case <-authTimeout.C:
+			deleteSessionIfCurrent(remoteID, sess)
+			closeAgent()
+			return nil, fmt.Errorf("timeout waiting for remote auth from %s", remoteID)
+		}
+	}
+haveRemoteAuth:
 
 	// 60s is comfortably longer than pion's default 30s connectivity-check
 	// window. If Dial/Accept hasn't succeeded by then, ICE has already
@@ -925,6 +1131,7 @@ func dialICE(cfg *Config, remoteID string) (*ice.Conn, error) {
 		conn, err = agent.Accept(dialCtx, remote[0], remote[1])
 	}
 	if err != nil {
+		deleteSessionIfCurrent(remoteID, sess)
 		closeAgent()
 		return nil, err
 	}
@@ -939,6 +1146,15 @@ func dialICE(cfg *Config, remoteID string) (*ice.Conn, error) {
 			pair.Local.NetworkType().NetworkShort())
 	}
 	return conn, nil
+}
+
+func iceIPFilter() func(net.IP) bool {
+	if os.Getenv("MESH_CONN_LOOPBACK_ONLY") != "1" {
+		return nil
+	}
+	return func(ip net.IP) bool {
+		return ip.IsLoopback()
+	}
 }
 
 func turnCreds(secret string, ttl time.Duration) (string, string) {

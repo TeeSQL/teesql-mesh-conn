@@ -15,12 +15,17 @@ This fork retains the upstream `LICENSE` and adds `NOTICE` attribution.
 ## TeeSQL patches
 
 - Robustness: `runPeerLink` now deletes the active peer session after a
-  failed or closed attempt, and the ICE state callback deletes it on
-  disconnected, failed, or closed transitions. This prevents stale
-  `authCh` values from a prior attempt from poisoning reconnects.
-- Security: QUIC no longer uses `InsecureSkipVerify`. Both peers load
-  the cluster CA root and use a cluster-CA-signed ephemeral certificate
-  for QUIC mutual TLS.
+  failed or closed attempt (`main.go:360`), and the ICE state callback
+  deletes it on disconnected, failed, or closed transitions
+  (`main.go:1055`). Session deletion drains `authCh` and closes the ICE
+  agent (`main.go:952`). Reconnect attempts also republish auth and
+  candidates while the ICE attempt is live (`main.go:1082`), so retry
+  ordering cannot strand one side waiting for a dropped pre-session auth.
+- Security: QUIC no longer uses `InsecureSkipVerify`. The client verifies
+  the server chain against the cluster CA (`main.go:787`), the server
+  requires and verifies client certs (`main.go:802`), and each process
+  signs an ephemeral QUIC leaf cert from the cluster CA key
+  (`main.go:817`).
 
 ## Build
 
